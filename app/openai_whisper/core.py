@@ -7,7 +7,7 @@ import torch
 import whisper
 from whisper.utils import ResultWriter, WriteTXT, WriteSRT, WriteVTT, WriteTSV, WriteJSON
 
-model_name = os.getenv("ASR_MODEL", "large")
+model_name = os.getenv("ASR_MODEL", "medium")
 model_path = os.getenv("ASR_MODEL_PATH", os.path.join(os.path.expanduser("~"), ".cache", "whisper"))
 
 if torch.cuda.is_available():
@@ -24,6 +24,7 @@ def transcribe(
         initial_prompt: Union[str, None],
         vad_filter: Union[bool, None],
         word_timestamps: Union[bool, None],
+        top_k:Union[int,None],
         output
 ):
     options_dict = {"task": task}
@@ -33,8 +34,35 @@ def transcribe(
         options_dict["initial_prompt"] = initial_prompt
     if word_timestamps:
         options_dict["word_timestamps"] = word_timestamps
-    with model_lock:
-        result = model.transcribe(audio, **options_dict)
+    if top_k:
+        options_dict["top_k"]=top_k
+    audio_length = len(audio) / 16000  # assuming the sample rate is 16000 Hz
+
+    if audio_length <= 30:
+        # Direct transcription for short audio
+        with model_lock:
+            result = model.transcribe(audio, **options_dict)
+    else:
+        # First transcription for long audio
+        with model_lock:
+            initial_result = model.transcribe(audio, **options_dict)
+        
+        segments = initial_result['segments']
+        
+        # Improve transcription for each segment
+        improved_segments = []
+        for segment in segments:
+            segment_audio = extract_segment_audio(audio, segment['start'], segment['end'])
+            with model_lock:
+                segment_result = model.transcribe(segment_audio, **options_dict)
+                for seg in segment_result['segments']:
+                    improved_segments.append(seg)
+        
+        # Combine and sort segments by start time
+        result = {
+            'text': ' '.join([seg['text'] for seg in improved_segments]),
+            'segments': sorted(improved_segments, key=lambda x: x['start'])
+        }
 
     output_file = StringIO()
     write_result(result, output_file, output)
@@ -43,14 +71,19 @@ def transcribe(
     return output_file
 
 
+def extract_segment_audio(audio, start, end, sample_rate=16000):
+    """
+    Extracts a segment of the audio between start and end times.
+    """
+    start_sample = int(start * sample_rate)
+    end_sample = int(end * sample_rate)
+    return audio[start_sample:end_sample]
+
 def language_detection(audio):
-    # load audio and pad/trim it to fit 30 seconds
     audio = whisper.pad_or_trim(audio)
 
-    # make log-Mel spectrogram and move to the same device as the model
     mel = whisper.log_mel_spectrogram(audio).to(model.device)
 
-    # detect the spoken language
     with model_lock:
         _, probs = model.detect_language(mel)
     detected_lang_code = max(probs, key=probs.get)
